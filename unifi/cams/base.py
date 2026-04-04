@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import atexit
 import json
 import logging
@@ -41,6 +42,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._motion_event_ts: Optional[float] = None
         self._motion_object_type: Optional[SmartDetectObjectType] = None
         self._ffmpeg_handles: dict[str, subprocess.Popen] = {}
+        self._stream_tasks: dict[str, any] = {}
 
         # Set up ssl context for requests
         self._ssl_context = ssl.create_default_context()
@@ -922,11 +924,59 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def start_video_stream(
         self, stream_index: str, stream_name: str, destination: tuple[str, int]
     ):
+        """Start video via ms CLI pullStream command.
+
+        Protect 7.x uses a proprietary LiveFLV protocol that requires
+        ingest points created via the ms binary's CLI. Instead of trying
+        to push FLV data, we tell ms to pull the RTSP source directly
+        using the pullStream CLI command on port 1112.
+
+        Falls back to the legacy ffmpeg+clock_sync pipeline if the CLI
+        connection fails (e.g. no SSH tunnel to the NVR).
+        """
+        channel = {"video1": 0, "video2": 1, "video3": 2}.get(stream_index, 0)
+        mac_upper = self.args.mac.replace(":", "").upper()
+        local_name = f"{mac_upper}_{channel}"
+
+        if stream_index in self._stream_tasks:
+            return
+
+        source = await self.get_stream_source(stream_index)
+
+        # Try pullStream via ms CLI (Protect 7.x)
+        try:
+            import socket as _sock
+            cli = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            cli.settimeout(5)
+            cli.connect((destination[0], 1112))
+            cmd = (
+                f"pullStream uri={source} localStreamName={local_name}"
+                f" forceTcp=1 keepAlive=1\n"
+            )
+            cli.sendall(cmd.encode())
+            await asyncio.sleep(2)
+            resp = cli.recv(4096)
+            cli.close()
+            if b"SUCCESS" in resp:
+                self.logger.info(
+                    f"pullStream {stream_index} ({local_name}): OK"
+                )
+                self._stream_tasks[stream_index] = True
+                return
+            else:
+                self.logger.warning(
+                    f"pullStream {local_name} failed, falling back to FLV push"
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"pullStream CLI unavailable ({e}), falling back to FLV push"
+            )
+
+        # Fallback: legacy ffmpeg + clock_sync + nc pipeline
         has_spawned = stream_index in self._ffmpeg_handles
         is_dead = has_spawned and self._ffmpeg_handles[stream_index].poll() is not None
 
         if not has_spawned or is_dead:
-            source = await self.get_stream_source(stream_index)
             cmd = (
                 "ffmpeg -nostdin -loglevel error -y"
                 f" {self.get_base_ffmpeg_args(stream_index)} -rtsp_transport"
@@ -934,12 +984,14 @@ class UnifiCamBase(metaclass=ABCMeta):
                 f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
                 f" streamName={stream_name} -f flv - | {sys.executable} -m"
                 " unifi.clock_sync"
-                f" {'--write-timestamps' if self._needs_flv_timestamps else ''} | nc"
-                f" {destination[0]} {destination[1]}"
+                f" {'--write-timestamps' if self._needs_flv_timestamps else ''}"
+                f" | nc {destination[0]} {destination[1]}"
             )
 
             if is_dead:
-                self.logger.warn(f"Previous ffmpeg process for {stream_index} died.")
+                self.logger.warn(
+                    f"Previous ffmpeg process for {stream_index} died."
+                )
 
             self.logger.info(
                 f"Spawning ffmpeg for {stream_index} ({stream_name}): {cmd}"
