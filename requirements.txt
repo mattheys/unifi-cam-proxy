@@ -7,6 +7,7 @@ flvlib3@https://github.com/zkonge/flvlib3/archive/master.zip
 hikvisionapi>=0.3.2
 semver
 packaging
+paho-mqtt<2.0.0
 uiprotect
 reolinkapi
 websockets<14.0
